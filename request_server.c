@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #include <wasm.h>
 #include <wasmtime.h>
-#include <func.h>
+#include <wasmtime/func.h>
 #include <unistd.h>
 
 #define handle_error(msg) \
