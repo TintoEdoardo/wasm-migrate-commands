@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <semaphore.h>
 #include <sys/mman.h>
+#include <wasi.h>
 #include <wasm.h>
 #include <wasmtime.h>
 #include <wasmtime/func.h>
@@ -79,6 +80,9 @@ static wasm_trap_t *should_migrate(void *env, wasmtime_caller_t *caller,
 static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
                                       const wasmtime_val_t *args, size_t nargs,
                                       wasmtime_val_t *results, size_t nresults) {
+
+    printf("Restoring memory...\n");
+
     // Extract the caller state.
     wasmtime_context_t *context = wasmtime_caller_context(caller);
     struct State *state = wasmtime_context_get_data(context);
@@ -112,7 +116,7 @@ static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
     FILE *checkpoint_memory_fd = fopen(path_to_checkpoint_memory, "r");
     if(checkpoint_memory_fd != NULL) {
         // Note that we are reading at most 4KB from the checkpoint_memory.
-        fread(checkpoint_memory_fd, 1, 4 * 1024, main_memory_fd);
+        fread(checkpoint_memory_ref, 1, 4 * 1024, main_memory_fd);
     } // Ignore otherwise.
     fclose(checkpoint_memory_fd);
 
@@ -136,29 +140,22 @@ int request_server_workload(
 
     // Prepare a process-level semaphore to signal when to start
     // running a computation.
-    int fd = open(path_to_ipc_file, O_RDONLY | O_WRONLY);
+    int fd = open(path_to_ipc_file, O_RDWR);
     if (fd == -1)
-        handle_error("Failed to open file (fd == -1)");
+        handle_error("Failed to open file (fd == -1)\n");
     int size_of_sem = sizeof(sem_t);
-    ftruncate(fd, size_of_sem);
-    sem_t *proceed_to_run =
-            mmap(NULL, size_of_sem, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
-    if (proceed_to_run == MAP_FAILED)
-        handle_error("Failed to call mmap (proceed_to_run == MAP_FAILED)");
-    sem_init(proceed_to_run, 1, 0);
-    close(fd);
-
-    // Then do the same thing fot signalling a pending migration.
-    fd = open(path_to_ipc_file, O_RDONLY | O_WRONLY);
-    if (fd == -1)
-        handle_error("Failed to open file (fd == -1)");
+    // Prepare to host two semaphores.
     ftruncate(fd, size_of_sem * 2);
-    sem_t *should_migrate_sem =
-            mmap(NULL, size_of_sem, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, size_of_sem);
-    if (should_migrate_sem == MAP_FAILED)
-        handle_error("Failed to call mmap (should_migrate_sem == MAP_FAILED)");
-    sem_init(should_migrate_sem, 1, 0);
+    // Here semaphores is an array of two semaphores.
+    sem_t *semaphores = mmap(NULL, size_of_sem * 2, O_RDWR, MAP_FILE | MAP_SHARED, fd, 0);
+    if (semaphores == MAP_FAILED)
+        handle_error("Failed to call mmap (semaphores == MAP_FAILED)\n");
     close(fd);
+    // The real semaphores are defined next.
+    sem_t *proceed_to_run = &semaphores[0];
+    sem_init(proceed_to_run, 1, 0);
+    sem_t *should_migrate_sem = &semaphores[1];
+    sem_init(should_migrate_sem, 1, 0);
 
     //----------------------------------//
     //          Initialization          //
@@ -186,69 +183,86 @@ int request_server_workload(
     // Initialize the context.
     wasmtime_context_t *context = wasmtime_store_context(store);
 
+    // Create a linker with WASI functions defined.
+    wasmtime_linker_t *linker = wasmtime_linker_new(engine);
+    wasmtime_error_t *error   = wasmtime_linker_define_wasi(linker);
+    if (error != NULL)
+        exit_with_error("Failed to link Wasi. \n", error, NULL);
+
     // Read Wasm bytecode from file.
-    FILE *file = fopen(path_to_file, "r");
-    assert(file != NULL);
+    printf("Loading binary...\n");
+    FILE *file = fopen(path_to_file, "rb");
+    if (!file) {
+        printf("> Error opening module. \n");
+        return 1;
+    }
     fseek(file, 0L, SEEK_END);
     size_t file_size = ftell(file);
     fseek(file, 0L, SEEK_SET);
-    wasm_byte_vec_t wat;
-    wasm_byte_vec_new_uninitialized(&wat, file_size);
-    if (fread(wat.data, file_size, 1, file) != 1) {
-        printf("> Error loading module!\n");
+    wasm_byte_vec_t binary;
+    wasm_byte_vec_new_uninitialized(&binary, file_size);
+    if (fread(binary.data, file_size, 1, file) != 1) {
+        printf("> Error reading module!\n");
         return 1;
     }
     fclose(file);
 
-    // Parse the wat into the binary wasm format.
-    wasm_byte_vec_t wasm;
-    wasmtime_error_t *error = wasmtime_wat2wasm(wat.data, wat.size, &wasm);
-    if (error != NULL)
-        exit_with_error("failed to parse wat", error, NULL);
-    wasm_byte_vec_delete(&wat);
-
     // Compile the module.
     printf("Compiling module...\n");
     wasmtime_module_t *module = NULL;
-    error = wasmtime_module_new(engine, (uint8_t *)wasm.data, wasm.size, &module);
-    wasm_byte_vec_delete(&wasm);
+    error   = wasmtime_module_new(engine, (uint8_t *)binary.data, binary.size, &module);
+    wasm_byte_vec_delete(&binary);
     if (error != NULL)
-        exit_with_error("failed to compile module", error, NULL);
+        exit_with_error("Failed to compile module. \n", error, NULL);
+
+    // Instantiate wasi
+    wasi_config_t *wasi_config = wasi_config_new();
+    assert(wasi_config);
+    wasmtime_config_wasm_multi_memory_set(config, true);
+
+    wasi_config_inherit_argv(wasi_config);
+    wasi_config_inherit_env(wasi_config);
+    wasi_config_inherit_stdin(wasi_config);
+    wasi_config_inherit_stdout(wasi_config);
+    wasi_config_inherit_stderr(wasi_config);
+    wasm_trap_t *trap = NULL;
+    error = wasmtime_context_set_wasi(context, wasi_config);
+    if (error != NULL)
+        exit_with_error("Failed to instantiate Wasi. ", error, NULL);
 
     // Add the expected callbacks for checkpoint and restore.
-    printf("Creating callback...\n");
-    wasm_functype_t *should_migrate_ty = wasm_functype_new_0_0();
+    printf("Creating callbacks...\n");
+    wasm_functype_t *should_migrate_ty = wasm_functype_new_0_1(wasm_valtype_new_i32());
     wasmtime_func_t should_migrate_t;
     wasmtime_func_new(context, should_migrate_ty, should_migrate, NULL, NULL, &should_migrate_t);
+    wasmtime_linker_define_func(linker, "host", strlen("host"), "should_migrate", strlen("should_migrate"), should_migrate_ty,
+                                should_migrate, NULL, NULL);
 
     wasm_functype_t *restore_memory_ty = wasm_functype_new_0_0();
     wasmtime_func_t restore_memory_t;
     wasmtime_func_new(context, restore_memory_ty, restore_memory, NULL, NULL, &restore_memory_t);
+    wasmtime_linker_define_func(linker, "host", strlen("host"), "restore_memory", strlen("restore_memory"), restore_memory_ty,
+                                restore_memory, NULL, NULL);
 
     // Instantiate the module.
     printf("Instantiating module...\n");
-    wasm_trap_t *trap = NULL;
-    wasmtime_instance_t instance;
-    wasmtime_extern_t imports[2];
-    imports[0].kind = WASMTIME_EXTERN_FUNC;
-    imports[0].of.func = should_migrate_t;
-    imports[1].kind = WASMTIME_EXTERN_FUNC;
-    imports[1].of.func = restore_memory_t;
-    error = wasmtime_instance_new(context, module, imports, 1, &instance, &trap);
-    if (error != NULL || trap != NULL)
-        exit_with_error("failed to instantiate", error, trap);
+    error = wasmtime_linker_module(linker, context, "", 0, module);
+    if (error != NULL)
+        exit_with_error("Failed to instantiate module. ", error, NULL);
 
     // Lookup our `run` export function.
     printf("Extracting export...\n");
-    wasmtime_extern_t run;
-    bool ok = wasmtime_instance_export_get(context, &instance, "run", 3, &run);
-    assert(ok);
-    assert(run.kind == WASMTIME_EXTERN_FUNC);
+    wasmtime_func_t func;
+    error = wasmtime_linker_get_default(linker, context, "", 0, &func);
+    printf("After extraction...\n");
+    if (error != NULL)
+        exit_with_error("failed to locate default export for module", error, NULL);
 
     //----------------------------------//
     //       Suspend until START        //
     //----------------------------------//
 
+    printf("Wait for activation...\n");
     sem_wait(proceed_to_run);
     // Once the semaphore is relinquished, proceed to:
 
@@ -258,9 +272,9 @@ int request_server_workload(
 
     // Call the function.
     printf("Calling export...\n");
-    error = wasmtime_func_call(context, &run.of.func, NULL, 0, NULL, 0, &trap);
+    error = wasmtime_func_call(context, &func, NULL, 0, NULL, 0, &trap);
     if (error != NULL || trap != NULL)
-        exit_with_error("failed to call function", error, trap);
+        exit_with_error("error calling default export", error, trap);
 
     // Finalize.
     printf("All finished!\n");
