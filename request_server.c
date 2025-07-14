@@ -12,7 +12,9 @@
 #include <wasm.h>
 #include <wasmtime.h>
 #include <wasmtime/func.h>
+#include <wasmtime/trap.h>
 #include <unistd.h>
+#include "shared_object.c"
 
 #define handle_error(msg) \
            do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -23,7 +25,7 @@ struct State {
     // Should migrate can be either:
     // 0      -> false
     // not 0  -> true
-    int should_migrate;
+    int *should_migrate;
     sem_t *semaphore;
     const char *path_to_main_memory;
     const char *path_to_checkpoint_memory;
@@ -51,6 +53,8 @@ static void exit_with_error(const char *message, wasmtime_error_t *error,
 static wasm_trap_t *should_migrate(void *env, wasmtime_caller_t *caller,
                                    const wasmtime_val_t *args, size_t nargs,
                                    wasmtime_val_t *results, size_t nresults) {
+
+    printf("Evaluate should_migrate. \n");
     // Return value.
     wasmtime_val_t result[1];
 
@@ -59,19 +63,20 @@ static wasm_trap_t *should_migrate(void *env, wasmtime_caller_t *caller,
     struct State *state = wasmtime_context_get_data(context);
 
     // Enqueue on the semaphore.
-    sem_wait(state->semaphore);
+    printf("Competing for lock...\n");
+    if (sem_wait(state->semaphore) == -1)
+        handle_error("sem_wait(state->semaphore) == -1\n");
+    printf("Within the state lock... \n");
 
     // When acquired, check should_migrate.
-    result[0].kind   = WASMTIME_I32;
-    result[0].of.i32 = state->should_migrate;
+    results[0].kind   = WASMTIME_I32;
+    results[0].of.i32 = *state->should_migrate;
     nresults         = sizeof result;
 
     // Relinquish the semaphore.
     sem_post(state->semaphore);
 
-    // And save the results.
-    results = result;
-
+    printf("End of should_migrate. \n");
     return NULL;
 }
 
@@ -93,6 +98,7 @@ static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
     wasmtime_memory_t memory, checkpoint_memory;
     wasmtime_extern_t memory_item, checkpoint_memory_item;
 
+    printf("Retrieve memory export...\n");
     // Get the main linear memory from the caller.
     wasmtime_caller_export_get(caller, "memory", strlen("memory"), &memory_item);
     memory = memory_item.of.memory;
@@ -107,19 +113,22 @@ static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
     //      Memory Initialization       //
     //----------------------------------//
     // This step is performed at runtime.
+    printf("Read memory file: %s\n", path_to_main_memory);
     FILE *main_memory_fd = fopen(path_to_main_memory, "r");
-    if(main_memory_fd != NULL) {
+    if (main_memory_fd != NULL) {
         fread(memory_ref, 1, 64 * 1024, main_memory_fd);
     } // Ignore otherwise.
     fclose(main_memory_fd);
 
+    printf("Read memory file: %s\n", path_to_checkpoint_memory);
     FILE *checkpoint_memory_fd = fopen(path_to_checkpoint_memory, "r");
-    if(checkpoint_memory_fd != NULL) {
+    if (checkpoint_memory_fd != NULL) {
         // Note that we are reading at most 4KB from the checkpoint_memory.
         fread(checkpoint_memory_ref, 1, 4 * 1024, main_memory_fd);
     } // Ignore otherwise.
     fclose(checkpoint_memory_fd);
 
+    printf("Memory restored. \n");
     return NULL;
 }
 
@@ -143,19 +152,24 @@ int request_server_workload(
     int fd = open(path_to_ipc_file, O_RDWR);
     if (fd == -1)
         handle_error("Failed to open file (fd == -1)\n");
-    int size_of_sem = sizeof(sem_t);
+    int size_of_shared_obj = sizeof(struct Shared_Object);
+
     // Prepare to host two semaphores.
-    ftruncate(fd, size_of_sem * 2);
+    ftruncate(fd, size_of_shared_obj);
     // Here semaphores is an array of two semaphores.
-    sem_t *semaphores = mmap(NULL, size_of_sem * 2, O_RDWR, MAP_FILE | MAP_SHARED, fd, 0);
-    if (semaphores == MAP_FAILED)
-        handle_error("Failed to call mmap (semaphores == MAP_FAILED)\n");
+    struct Shared_Object *shared_obj = mmap(NULL, size_of_shared_obj, O_RDWR, MAP_FILE | MAP_SHARED, fd, 0);
+    if (shared_obj == MAP_FAILED)
+        handle_error("Failed to call mmap (shared_obj == MAP_FAILED)\n");
     close(fd);
+
     // The real semaphores are defined next.
-    sem_t *proceed_to_run = &semaphores[0];
-    sem_init(proceed_to_run, 1, 0);
-    sem_t *should_migrate_sem = &semaphores[1];
-    sem_init(should_migrate_sem, 1, 0);
+    sem_t *proceed_to_run = &shared_obj->proceed_to_run;
+    if (sem_init(proceed_to_run, 1, 0) == -1)
+        handle_error("sem_init(proceed_to_run, 1, 0) == -1\n");
+    sem_t *should_migrate_sem = &shared_obj->should_migrate;
+    if (sem_init(should_migrate_sem, 1, 1) == -1)
+        handle_error("sem_init(should_migrate_sem, 1, 1) == -1\n");
+    shared_obj->should_migrate_flag = 0;
 
     //----------------------------------//
     //          Initialization          //
@@ -163,7 +177,7 @@ int request_server_workload(
 
     // The state of the Wasm computation.
     struct State state;
-    state.should_migrate            = 0;
+    state.should_migrate            = &shared_obj->should_migrate_flag;
     state.semaphore                 = should_migrate_sem;
     state.path_to_main_memory       = path_to_main_memory;
     state.path_to_checkpoint_memory = path_to_checkpoint_memory;
@@ -225,7 +239,6 @@ int request_server_workload(
     wasi_config_inherit_stdin(wasi_config);
     wasi_config_inherit_stdout(wasi_config);
     wasi_config_inherit_stderr(wasi_config);
-    wasm_trap_t *trap = NULL;
     error = wasmtime_context_set_wasi(context, wasi_config);
     if (error != NULL)
         exit_with_error("Failed to instantiate Wasi. ", error, NULL);
@@ -272,9 +285,28 @@ int request_server_workload(
 
     // Call the function.
     printf("Calling export...\n");
+    wasm_trap_t *trap = NULL;
     error = wasmtime_func_call(context, &func, NULL, 0, NULL, 0, &trap);
-    if (error != NULL || trap != NULL)
+    if (error != NULL)
         exit_with_error("error calling default export", error, trap);
+
+    if (trap != NULL) {
+        wasm_message_t message;
+        wasmtime_trap_code_t code;
+        wasm_trap_message(trap, &message);
+        bool is_wasm_trap = wasmtime_trap_code(trap, &code);
+        wasm_trap_delete(trap);
+        if (is_wasm_trap && code == WASMTIME_TRAP_CODE_UNREACHABLE_CODE_REACHED) {
+            printf("Checkpoint completed. \n");
+        }
+        else {
+            fprintf(stdout, "%.*s\n", (int)message.size, message.data);
+        }
+        wasm_byte_vec_delete(&message);
+    }
+
+    // Save the checkpoint (if any).
+    //TODO!
 
     // Finalize.
     printf("All finished!\n");
