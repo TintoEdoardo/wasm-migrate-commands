@@ -124,7 +124,7 @@ static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
     FILE *checkpoint_memory_fd = fopen(path_to_checkpoint_memory, "r");
     if (checkpoint_memory_fd != NULL) {
         // Note that we are reading at most 4KB from the checkpoint_memory.
-        fread(checkpoint_memory_ref, 1, 4 * 1024, main_memory_fd);
+        fread(checkpoint_memory_ref, 1, 4 * 1024, checkpoint_memory_fd);
     } // Ignore otherwise.
     fclose(checkpoint_memory_fd);
 
@@ -259,17 +259,27 @@ int request_server_workload(
 
     // Instantiate the module.
     printf("Instantiating module...\n");
-    error = wasmtime_linker_module(linker, context, "", 0, module);
+    // error = wasmtime_linker_module(linker, context, "", 0, module);
+    wasmtime_instance_t instance;
+    wasm_trap_t *trap;
+    error = wasmtime_linker_instantiate(linker, context, module, &instance, &trap);
     if (error != NULL)
         exit_with_error("Failed to instantiate module. ", error, NULL);
+
+    // Register our new `linking2` instance with the linker
+    error = wasmtime_linker_define_instance(linker, context, "",
+                                            strlen(""), &instance);
+    if (error != NULL)
+        exit_with_error("Failed to link instance. ", error, NULL);
 
     // Lookup our `run` export function.
     printf("Extracting export...\n");
     wasmtime_func_t func;
+
     error = wasmtime_linker_get_default(linker, context, "", 0, &func);
     printf("After extraction...\n");
     if (error != NULL)
-        exit_with_error("failed to locate default export for module", error, NULL);
+       exit_with_error("failed to locate default export for module", error, NULL);
 
     //----------------------------------//
     //       Suspend until START        //
@@ -285,7 +295,6 @@ int request_server_workload(
 
     // Call the function.
     printf("Calling export...\n");
-    wasm_trap_t *trap = NULL;
     error = wasmtime_func_call(context, &func, NULL, 0, NULL, 0, &trap);
     if (error != NULL)
         exit_with_error("error calling default export", error, trap);
@@ -297,6 +306,44 @@ int request_server_workload(
         bool is_wasm_trap = wasmtime_trap_code(trap, &code);
         wasm_trap_delete(trap);
         if (is_wasm_trap && code == WASMTIME_TRAP_CODE_UNREACHABLE_CODE_REACHED) {
+
+            //----------------------------------//
+            //        Checkpoint section        //
+            //----------------------------------//
+
+            wasmtime_memory_t memory, checkpoint_memory;
+            wasmtime_extern_t memory_item, checkpoint_memory_item;
+
+            // Get the main linear memory from the caller.
+            wasmtime_instance_export_get(context, &instance, "memory", strlen("memory"), &memory_item);
+            memory = memory_item.of.memory;
+            uint8_t *memory_ref = wasmtime_memory_data(context, &memory);
+
+            // Get the checkpoint memory from the caller.
+            wasmtime_instance_export_get(context, &instance, "checkpoint_memory", strlen("checkpoint_memory"), &checkpoint_memory_item);
+            checkpoint_memory = checkpoint_memory_item.of.memory;
+            uint8_t *checkpoint_memory_ref = wasmtime_memory_data(context, &checkpoint_memory);
+
+            FILE *main_memory_fd = fopen(path_to_main_memory, "w+");
+            if (main_memory_fd != NULL) {
+                fwrite(memory_ref, 1, 64 * 1024, main_memory_fd);
+            }
+            else {
+                printf("main_memory_fd == NULL\n");
+                exit(1);
+            }
+            fclose(main_memory_fd);
+
+            FILE *checkpoint_memory_fd = fopen(path_to_checkpoint_memory, "w+");
+            if (checkpoint_memory_fd != NULL) {
+                fwrite(checkpoint_memory_ref, 1, 4 * 1024, checkpoint_memory_fd);
+            }
+            else {
+                printf("checkpoint_memory_fd == NULL\n");
+                exit(1);
+            }
+            fclose(checkpoint_memory_fd);
+
             printf("Checkpoint completed. \n");
         }
         else {
@@ -304,9 +351,6 @@ int request_server_workload(
         }
         wasm_byte_vec_delete(&message);
     }
-
-    // Save the checkpoint (if any).
-    //TODO!
 
     // Finalize.
     printf("All finished!\n");
