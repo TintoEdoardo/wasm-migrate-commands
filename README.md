@@ -16,7 +16,10 @@
 <h1>Running the commands</h1>
 
 <h3>Create Command</h3>
-```./create_command comp.wasm ipc_file.txt main_memory.b checkpoint_memory.b```
+```
+./create_command comp.wasm ipc_file.txt main_memory.b checkpoint_memory.b
+```
+
 <h6>Arguments</h6>
 1. ```comp.wasm```: a Webassembly module that might (or might not) have injected the checkpoint and restore (C/R) procedures in https://github.com/TintoEdoardo/wasm-tools/tree/develop. 
 2. ```ipc_file.txt```: used for IPC communication. 
@@ -24,7 +27,9 @@
 4. ```checkpoint_memory.b```: if the file exists it is used to populate the checkpoint memory of the function with (C/R). 
 
 <h3>Start Command</h3>
-```./start_command ipc_file.txt```
+```
+./start_command ipc_file.txt
+```
 <h6>Arguments</h6>
 1. ```ipc_file.txt```: used for IPC communication.
 
@@ -32,7 +37,10 @@
 Fails if there is no process created with ```create_command``` waiting for activation.
 
 <h3>Migrate Command</h3>
-```./migrate_command ipc_file.txt```
+```
+./migrate_command ipc_file.txt
+```
+
 <h6>Arguments</h6>
 1. ```ipc_file.txt```: used for IPC communication.
 
