@@ -117,16 +117,16 @@ static wasm_trap_t *restore_memory(void *env, wasmtime_caller_t *caller,
     FILE *main_memory_fd = fopen(path_to_main_memory, "r");
     if (main_memory_fd != NULL) {
         fread(memory_ref, 1, 64 * 1024, main_memory_fd);
+        fclose(main_memory_fd);
     } // Ignore otherwise.
-    fclose(main_memory_fd);
 
     printf("Read memory file: %s\n", path_to_checkpoint_memory);
     FILE *checkpoint_memory_fd = fopen(path_to_checkpoint_memory, "r");
     if (checkpoint_memory_fd != NULL) {
         // Note that we are reading at most 4KB from the checkpoint_memory.
         fread(checkpoint_memory_ref, 1, 4 * 1024, checkpoint_memory_fd);
+        fclose(checkpoint_memory_fd);
     } // Ignore otherwise.
-    fclose(checkpoint_memory_fd);
 
     printf("Memory restored. \n");
     return NULL;
